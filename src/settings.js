@@ -2049,6 +2049,17 @@ var RUNTIME_DEBUG = false;
 // library symbol.
 var LEGACY_RUNTIME = false;
 
+// If true, extract_metadata treats strings in em_js, em_asm, em_lib_deps sections
+// as non null treminated strings, that stores their length in first n bytes.
+// It is assumed that in that case string looks like that:
+// | n bytes for string length | bytes of actual string |
+var NON_NULL_TERMINATED_STRINGS_IN_EM_SECTIONS = false;
+
+// In case of non null terminated strings it is a count of bytes 
+// in the beginign of the string in which string's length is stored.
+// Otherwise it is not used.
+var NON_NULL_TERMINATED_STRINGS_LENGTH_BYTES_COUNT = 4;
+
 //===========================================
 // Internal, used for testing only, from here
 //===========================================

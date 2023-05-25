@@ -208,10 +208,36 @@ def get_section_strings(module, export_map, section_name):
   size = end_addr - start_addr
   end = seg_offset + size
   while str_start < end:
-    str_end = data.find(b'\0', str_start)
-    asm_strings[start_addr - seg_offset + str_start] = data_to_string(data[str_start:str_end])
-    str_start = str_end + 1
+    result_string, string_length = get_string_from_data(data, str_start)
+    string_address = start_addr - seg_offset + str_start
+    if settings.NON_NULL_TERMINATED_STRINGS_IN_EM_SECTIONS:
+      string_address = string_address + settings.NON_NULL_TERMINATED_STRINGS_LENGTH_BYTES_COUNT
+    asm_strings[string_address] = result_string
+    str_start = get_next_string_start(str_start, string_length)
   return asm_strings
+
+
+def get_next_string_start(str_start, string_bytes_count):
+  if settings.NON_NULL_TERMINATED_STRINGS_IN_EM_SECTIONS:
+    length_bytes_count = settings.NON_NULL_TERMINATED_STRINGS_LENGTH_BYTES_COUNT
+    str_start = str_start + length_bytes_count
+    if string_bytes_count % length_bytes_count != 0:
+      string_bytes_count = ((string_bytes_count // length_bytes_count) + 1) * length_bytes_count
+    next_string_start = str_start + string_bytes_count
+  else:
+    next_string_start = str_start + string_bytes_count + 1
+  return next_string_start
+
+
+def get_string_from_data(data, str_start):
+  if settings.NON_NULL_TERMINATED_STRINGS_IN_EM_SECTIONS:
+    length_bytes_count = settings.NON_NULL_TERMINATED_STRINGS_LENGTH_BYTES_COUNT
+    string_bytes_count = int.from_bytes(data[str_start:str_start + length_bytes_count], "little")
+    str_start = str_start + length_bytes_count
+    str_end = str_start + string_bytes_count
+  else:
+    str_end = data.find(b'\0', str_start)
+  return data_to_string(data[str_start:str_end]), str_end - str_start
 
 
 def get_main_reads_params(module, export_map):
@@ -273,8 +299,8 @@ def update_metadata(filename, metadata):
 def get_string_at(module, address):
   seg, offset = find_segment_with_address(module, address)
   data = module.read_at(seg.offset, seg.size)
-  str_end = data.find(b'\0', offset)
-  return data_to_string(data[offset:str_end])
+  result_string, _ = get_string_from_data(data, offset)
+  return result_string
 
 
 class Metadata:
