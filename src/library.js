@@ -20,10 +20,14 @@
 // object. For convenience, the short name appears here. Note that if you add a
 // new function with an '_', it will not be found.
 
-mergeInto(LibraryManager.library, {
+addToLibrary({
   $ptrToString: (ptr) => {
 #if ASSERTIONS
     assert(typeof ptr === 'number');
+#endif
+#if !CAN_ADDRESS_2GB && !MEMORY64
+    // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
+    ptr >>>= 0;
 #endif
     return '0x' + ptr.toString(16).padStart(8, '0');
   },
@@ -116,9 +120,7 @@ mergeInto(LibraryManager.library, {
   // We have a separate JS version `getHeapMax()` which can be called directly
   // avoiding any wrapper added for wasm64.
   emscripten_get_heap_max__deps: ['$getHeapMax'],
-  emscripten_get_heap_max: () => {
-    return getHeapMax();
-  },
+  emscripten_get_heap_max: () => getHeapMax(),
 
   $getHeapMax: () =>
 #if ALLOW_MEMORY_GROWTH
@@ -157,9 +159,9 @@ mergeInto(LibraryManager.library, {
   // it. Returns 1 on success, 0 on error.
   $growMemory: (size) => {
     var b = wasmMemory.buffer;
-    var pages = (size - b.byteLength + 65535) >>> 16;
+    var pages = (size - b.byteLength + {{{ WASM_PAGE_SIZE - 1 }}}) / {{{ WASM_PAGE_SIZE }}};
 #if RUNTIME_DEBUG
-    dbg(`emscripten_resize_heap: ${size} (+${size - b.byteLength} bytes / ${pages} pages)`);
+    dbg(`growMemory: ${size} (+${size - b.byteLength} bytes / ${pages} pages)`);
 #endif
 #if MEMORYPROFILER
     var oldHeapSize = b.byteLength;
@@ -199,8 +201,9 @@ mergeInto(LibraryManager.library, {
   emscripten_resize_heap: 'ip',
   emscripten_resize_heap: (requestedSize) => {
     var oldSize = HEAPU8.length;
-#if MEMORY64 != 1
-    requestedSize = requestedSize >>> 0;
+#if !MEMORY64 && !CAN_ADDRESS_2GB
+    // With CAN_ADDRESS_2GB or MEMORY64, pointers are already unsigned.
+    requestedSize >>>= 0;
 #endif
 #if ALLOW_MEMORY_GROWTH == 0
 #if ABORTING_MALLOC
@@ -246,7 +249,7 @@ mergeInto(LibraryManager.library, {
     var maxHeapSize = getHeapMax();
     if (requestedSize > maxHeapSize) {
 #if ASSERTIONS
-      err(`Cannot enlarge memory, asked to go up to ${requestedSize} bytes, but the limit is ${maxHeapSize} bytes!`);
+      err(`Cannot enlarge memory, requested ${requestedSize} bytes, but the limit is ${maxHeapSize} bytes!`);
 #endif
 #if ABORTING_MALLOC
       abortOnCannotGrowMemory(requestedSize);
@@ -280,7 +283,7 @@ mergeInto(LibraryManager.library, {
       var replacement = growMemory(newSize);
 #if ASSERTIONS == 2
       var t1 = _emscripten_get_now();
-      out(`Heap resize call from ${oldSize} to ${newSize} took ${(t1 - t0)} msecs. Success: ${!!replacement}`);
+      dbg(`Heap resize call from ${oldSize} to ${newSize} took ${(t1 - t0)} msecs. Success: ${!!replacement}`);
 #endif
       if (replacement) {
 #if ASSERTIONS && WASM2JS
@@ -381,20 +384,9 @@ mergeInto(LibraryManager.library, {
   // the initial values of the environment accessible by getenv.
   $ENV: {},
 
-  getloadavg: (loadavg, nelem) => {
-    // int getloadavg(double loadavg[], int nelem);
-    // http://linux.die.net/man/3/getloadavg
-    var limit = Math.min(nelem, 3);
-    var doubleSize = {{{ getNativeTypeSize('double') }}};
-    for (var i = 0; i < limit; i++) {
-      {{{ makeSetValue('loadavg', 'i * doubleSize', '0.1', 'double') }}};
-    }
-    return limit;
-  },
-
   // In -Oz builds, we replace memcpy() altogether with a non-unrolled wasm
-  // variant, so we should never emit emscripten_memcpy_big() in the build.
-  // In STANDALONE_WASM we avoid the emscripten_memcpy_big dependency so keep
+  // variant, so we should never emit emscripten_memcpy_js() in the build.
+  // In STANDALONE_WASM we avoid the emscripten_memcpy_js dependency so keep
   // the wasm file standalone.
   // In BULK_MEMORY mode we include native versions of these functions based
   // on memory.fill and memory.copy.
@@ -415,11 +407,11 @@ mergeInto(LibraryManager.library, {
   //   AppleWebKit/605.1.15 Safari/604.1 Version/13.0.4 iPhone OS 13_3 on iPhone 6s with iOS 13.3
   //   AppleWebKit/605.1.15 Version/13.0.3 Intel Mac OS X 10_15_1 on Safari 13.0.3 (15608.3.10.1.4) on macOS Catalina 10.15.1
   // Hence the support status of .copyWithin() for Safari version range [10.0.0, 10.1.0] is unknown.
-  emscripten_memcpy_big: `= Uint8Array.prototype.copyWithin
+  emscripten_memcpy_js: `= Uint8Array.prototype.copyWithin
     ? (dest, src, num) => HEAPU8.copyWithin(dest, src, src + num)
     : (dest, src, num) => HEAPU8.set(HEAPU8.subarray(src, src+num), dest)`,
 #else
-  emscripten_memcpy_big: (dest, src, num) => HEAPU8.copyWithin(dest, src, src + num),
+  emscripten_memcpy_js: (dest, src, num) => HEAPU8.copyWithin(dest, src, src + num),
 #endif
 
 #endif
@@ -436,6 +428,7 @@ mergeInto(LibraryManager.library, {
   // time.h
   // ==========================================================================
 
+  _mktime_js__i53abi: true,
   _mktime_js__deps: ['$ydayFromDate'],
   _mktime_js: (tmPtr) => {
     var date = new Date({{{ makeGetValue('tmPtr', C_STRUCTS.tm.tm_year, 'i32') }}} + 1900,
@@ -476,12 +469,12 @@ mergeInto(LibraryManager.library, {
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_mon, 'date.getMonth()', 'i32') }}};
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_year, 'date.getYear()', 'i32') }}};
 
-    return (date.getTime() / 1000)|0;
+    return date.getTime() / 1000;
   },
 
-  _gmtime_js__deps: ['$readI53FromI64'],
+  _gmtime_js__i53abi: true,
   _gmtime_js: (time, tmPtr) => {
-    var date = new Date({{{ makeGetValue('time', 0, 'i53') }}}*1000);
+    var date = new Date(time * 1000);
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_sec, 'date.getUTCSeconds()', 'i32') }}};
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_min, 'date.getUTCMinutes()', 'i32') }}};
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_hour, 'date.getUTCHours()', 'i32') }}};
@@ -494,6 +487,7 @@ mergeInto(LibraryManager.library, {
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_yday, 'yday', 'i32') }}};
   },
 
+  _timegm_js__i53abi: true,
   _timegm_js: (tmPtr) => {
     var time = Date.UTC({{{ makeGetValue('tmPtr', C_STRUCTS.tm.tm_year, 'i32') }}} + 1900,
                         {{{ makeGetValue('tmPtr', C_STRUCTS.tm.tm_mon, 'i32') }}},
@@ -509,12 +503,13 @@ mergeInto(LibraryManager.library, {
     var yday = ((date.getTime() - start) / (1000 * 60 * 60 * 24))|0;
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_yday, 'yday', 'i32') }}};
 
-    return (date.getTime() / 1000)|0;
+    return date.getTime() / 1000;
   },
 
-  _localtime_js__deps: ['$readI53FromI64', '$ydayFromDate'],
+  _localtime_js__i53abi: true,
+  _localtime_js__deps: ['$ydayFromDate'],
   _localtime_js: (time, tmPtr) => {
-    var date = new Date({{{ makeGetValue('time', 0, 'i53') }}}*1000);
+    var date = new Date(time*1000);
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_sec, 'date.getSeconds()', 'i32') }}};
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_min, 'date.getMinutes()', 'i32') }}};
     {{{ makeSetValue('tmPtr', C_STRUCTS.tm.tm_hour, 'date.getHours()', 'i32') }}};
@@ -698,7 +693,7 @@ mergeInto(LibraryManager.library, {
     // size_t strftime(char *restrict s, size_t maxsize, const char *restrict format, const struct tm *restrict timeptr);
     // http://pubs.opengroup.org/onlinepubs/009695399/functions/strftime.html
 
-    var tm_zone = {{{ makeGetValue('tm', C_STRUCTS.tm.tm_zone, 'i32') }}};
+    var tm_zone = {{{ makeGetValue('tm', C_STRUCTS.tm.tm_zone, '*') }}};
 
     var date = {
       tm_sec: {{{ makeGetValue('tm', C_STRUCTS.tm.tm_sec, 'i32') }}},
@@ -1760,7 +1755,7 @@ mergeInto(LibraryManager.library, {
       names: {}
     },
 
-    lookup_name: (name) => {
+    lookup_name(name) {
       // If the name is already a valid ipv4 / ipv6 address, don't generate a fake one.
       var res = inetPton4(name);
       if (res !== null) {
@@ -1789,7 +1784,7 @@ mergeInto(LibraryManager.library, {
       return addr;
     },
 
-    lookup_addr: (addr) => {
+    lookup_addr(addr) {
       if (DNS.address_map.names[addr]) {
         return DNS.address_map.names[addr];
       }
@@ -2334,11 +2329,6 @@ mergeInto(LibraryManager.library, {
     // respective time origins.
     _emscripten_get_now = () => performance.timeOrigin + {{{ getPerformanceNow() }}}();
 #else
-#if ENVIRONMENT_MAY_BE_SHELL
-    if (typeof dateNow != 'undefined') {
-      _emscripten_get_now = dateNow;
-    } else
-#endif
 #if MIN_IE_VERSION <= 9 || MIN_FIREFOX_VERSION <= 14 || MIN_CHROME_VERSION <= 23 || MIN_SAFARI_VERSION <= 80400 || AUDIO_WORKLET // https://caniuse.com/#feat=high-resolution-time
     // AudioWorkletGlobalScope does not have performance.now()
     // (https://github.com/WebAudio/web-audio-api/issues/2527), so if building
@@ -2368,11 +2358,6 @@ mergeInto(LibraryManager.library, {
       return 1; // nanoseconds
     }
 #endif
-#if ENVIRONMENT_MAY_BE_SHELL
-    if (typeof dateNow != 'undefined') {
-      return 1000; // microseconds (1/1000 of a millisecond)
-    }
-#endif
 #if MIN_IE_VERSION <= 9 || MIN_FIREFOX_VERSION <= 14 || MIN_CHROME_VERSION <= 23 || MIN_SAFARI_VERSION <= 80400 // https://caniuse.com/#feat=high-resolution-time
     if (typeof performance == 'object' && performance && typeof performance['now'] == 'function') {
       return 1000; // microseconds (1/1000 of a millisecond)
@@ -2392,9 +2377,6 @@ mergeInto(LibraryManager.library, {
      ((typeof performance == 'object' && performance && typeof performance['now'] == 'function')
 #if ENVIRONMENT_MAY_BE_NODE
       || ENVIRONMENT_IS_NODE
-#endif
-#if ENVIRONMENT_MAY_BE_SHELL
-      || (typeof dateNow != 'undefined')
 #endif
     );`,
 #else
@@ -2417,37 +2399,7 @@ mergeInto(LibraryManager.library, {
     }
   },
 
-  // Returns [parentFuncArguments, functionName, paramListName]
-  $traverseStack: (args) => {
-    if (!args || !args.callee || !args.callee.name) {
-      return [null, '', ''];
-    }
-
-    var funstr = args.callee.toString();
-    var funcname = args.callee.name;
-    var str = '(';
-    var first = true;
-    for (var i in args) {
-      var a = args[i];
-      if (!first) {
-        str += ", ";
-      }
-      first = false;
-      if (typeof a == 'number' || typeof a == 'string') {
-        str += a;
-      } else {
-        str += `(${typeof a}})`;
-      }
-    }
-    str += ')';
-    var caller = args.callee.caller;
-    args = caller ? caller.arguments : [];
-    if (first)
-      str = '';
-    return [args, funcname, str];
-  },
-
-  $getCallstack__deps: ['$traverseStack', '$jsStackTrace', '$warnOnce'],
+  $getCallstack__deps: ['$jsStackTrace', '$warnOnce'],
   $getCallstack__docs: '/** @param {number=} flags */',
   $getCallstack: function(flags) {
     var callstack = jsStackTrace();
@@ -2460,25 +2412,12 @@ mergeInto(LibraryManager.library, {
     var iNextLine = callstack.indexOf('\n', Math.max(iThisFunc, iThisFunc2))+1;
     callstack = callstack.slice(iNextLine);
 
-    if (flags & {{{ cDefs.EM_LOG_DEMANGLE }}}) {
-      warnOnce('EM_LOG_DEMANGLE is deprecated; ignoring');
-    }
-
     // If user requested to see the original source stack, but no source map
     // information is available, just fall back to showing the JS stack.
     if (flags & {{{ cDefs.EM_LOG_C_STACK }}} && typeof emscripten_source_map == 'undefined') {
       warnOnce('Source map information is not available, emscripten_log with EM_LOG_C_STACK will be ignored. Build with "--pre-js $EMSCRIPTEN/src/emscripten-source-map.min.js" linker flag to add source map loading to code.');
       flags ^= {{{ cDefs.EM_LOG_C_STACK }}};
       flags |= {{{ cDefs.EM_LOG_JS_STACK }}};
-    }
-
-    var stack_args = null;
-    if (flags & {{{ cDefs.EM_LOG_FUNC_PARAMS }}}) {
-      // To get the actual parameters to the functions, traverse the stack via
-      // the unfortunately deprecated 'arguments.callee' method, if it works:
-      stack_args = traverseStack(arguments);
-      while (stack_args[1].includes('_emscripten_'))
-        stack_args = traverseStack(stack_args[0]);
     }
 
     // Process all lines:
@@ -2544,16 +2483,6 @@ mergeInto(LibraryManager.library, {
         }
         callstack += (haveSourceMap ? (`     = ${symbolName}`) : (`    at ${symbolName}`)) + ` (${file}:${lineno}:${column})\n`;
       }
-
-      // If we are still keeping track with the callstack by traversing via
-      // 'arguments.callee', print the function parameters as well.
-      if (flags & {{{ cDefs.EM_LOG_FUNC_PARAMS }}} && stack_args[0]) {
-        if (stack_args[1] == symbolName && stack_args[2].length > 0) {
-          callstack = callstack.replace(/\s+$/, '');
-          callstack += ' with values: ' + stack_args[1] + stack_args[2] + '\n';
-        }
-        stack_args = traverseStack(stack_args[0]);
-      }
     }
     // Trim extra whitespace at the end of the output.
     callstack = callstack.replace(/\s+$/, '');
@@ -2562,10 +2491,6 @@ mergeInto(LibraryManager.library, {
 
   emscripten_get_callstack__deps: ['$getCallstack', '$lengthBytesUTF8', '$stringToUTF8'],
   emscripten_get_callstack: function(flags, str, maxbytes) {
-    // Use explicit calls to from64 rather then using the __sig
-    // magic here.  This is because the __sig wrapper uses arrow function
-    // notation which causes the inner call to traverseStack to fail.
-    {{{ from64('str') }}};
     var callstack = getCallstack(flags);
     // User can query the required amount of bytes to hold the callstack.
     if (!str || maxbytes <= 0) {
@@ -2800,6 +2725,7 @@ mergeInto(LibraryManager.library, {
   emscripten_pc_get_function: (pc) => {
 #if !USE_OFFSET_CONVERTER
     abort('Cannot use emscripten_pc_get_function without -sUSE_OFFSET_CONVERTER');
+    return 0;
 #else
     var name;
     if (pc & 0x80000000) {
@@ -2909,6 +2835,20 @@ mergeInto(LibraryManager.library, {
       _free = prev_free;
     }
   },
+
+  _emscripten_sanitizer_use_colors: () => {
+    var setting = Module['printWithColors'];
+    if (setting !== undefined) {
+      return setting;
+    }
+    return ENVIRONMENT_IS_NODE && process.stderr.isTTY;
+  },
+
+  _emscripten_sanitizer_get_option__deps: ['$withBuiltinMalloc', '$stringToNewUTF8', '$UTF8ToString'],
+  _emscripten_sanitizer_get_option__sig: 'pp',
+  _emscripten_sanitizer_get_option: (name) => {
+    return withBuiltinMalloc(() => stringToNewUTF8(Module[UTF8ToString(name)] || ""));
+  },
 #endif
 
   $readEmAsmArgsArray: '=[]',
@@ -2929,40 +2869,34 @@ mergeInto(LibraryManager.library, {
     var ch;
     // Most arguments are i32s, so shift the buffer pointer so it is a plain
     // index into HEAP32.
-    buf >>= 2;
     while (ch = HEAPU8[sigPtr++]) {
 #if ASSERTIONS
       var chr = String.fromCharCode(ch);
-      var validChars = ['d', 'f', 'i'];
+      var validChars = ['d', 'f', 'i', 'p'];
 #if WASM_BIGINT
       // In WASM_BIGINT mode we support passing i64 values as bigint.
       validChars.push('j');
 #endif
-#if MEMORY64
-      // In MEMORY64 mode we also support passing i64 pointer types which
-      // get automatically converted to int53/Double.
-      validChars.push('p');
-#endif
       assert(validChars.includes(chr), `Invalid character ${ch}("${chr}") in readEmAsmArgs! Use only [${validChars}], and do not specify "v" for void return argument.`);
 #endif
-      // Floats are always passed as doubles, and doubles and int64s take up 8
-      // bytes (two 32-bit slots) in memory, align reads to these:
-      buf += (ch != 105/*i*/) & buf;
-#if MEMORY64
-      // Special case for pointers under wasm64 which we read as int53 Numbers.
-      if (ch == 112/*p*/) {
-        readEmAsmArgsArray.push(readI53FromI64(buf++ << 2));
-      } else
+      // Floats are always passed as doubles, so all types except for 'i'
+      // are 8 bytes and require alignment.
+      var wide = (ch != {{{ charCode('i') }}});
+#if !MEMORY64
+      wide &= (ch != {{{ charCode('p') }}});
 #endif
+      buf += wide && (buf % 8) ? 4 : 0;
       readEmAsmArgsArray.push(
-        ch == 105/*i*/ ? HEAP32[buf] :
+        // Special case for pointers under wasm64 or CAN_ADDRESS_2GB mode.
+        ch == {{{ charCode('p') }}} ? {{{ makeGetValue('buf', 0, '*') }}} :
 #if WASM_BIGINT
-       (ch == 106/*j*/ ? HEAP64 : HEAPF64)[buf++ >> 1]
-#else
-       HEAPF64[buf++ >> 1]
+        ch == {{{ charCode('j') }}} ? {{{ makeGetValue('buf', 0, 'i64') }}} :
 #endif
+        ch == {{{ charCode('i') }}} ?
+          {{{ makeGetValue('buf', 0, 'i32') }}} :
+          {{{ makeGetValue('buf', 0, 'double') }}}
       );
-      ++buf;
+      buf += wide ? 8 : 4;
     }
     return readEmAsmArgsArray;
   },
@@ -3032,8 +2966,8 @@ mergeInto(LibraryManager.library, {
 #if !DECLARE_ASM_MODULE_EXPORTS
   // When DECLARE_ASM_MODULE_EXPORTS is not set we export native symbols
   // at runtime rather than statically in JS code.
-  $exportAsmFunctions__deps: ['$asmjsMangle'],
-  $exportAsmFunctions: (asm) => {
+  $exportWasmSymbols__deps: ['$asmjsMangle'],
+  $exportWasmSymbols: (wasmExports) => {
 #if ENVIRONMENT_MAY_BE_NODE && ENVIRONMENT_MAY_BE_WEB
     var global_object = (typeof process != "undefined" ? global : this);
 #elif ENVIRONMENT_MAY_BE_NODE
@@ -3042,12 +2976,12 @@ mergeInto(LibraryManager.library, {
     var global_object = this;
 #endif
 
-    for (var __exportedFunc in asm) {
+    for (var __exportedFunc in wasmExports) {
       var jsname = asmjsMangle(__exportedFunc);
 #if MINIMAL_RUNTIME
-      global_object[jsname] = asm[__exportedFunc];
+      global_object[jsname] = wasmExports[__exportedFunc];
 #else
-      global_object[jsname] = Module[jsname] = asm[__exportedFunc];
+      global_object[jsname] = Module[jsname] = wasmExports[__exportedFunc];
 #endif
     }
 
@@ -3079,9 +3013,9 @@ mergeInto(LibraryManager.library, {
     }
   },
 
-  _Unwind_GetIPInfo: () => abort('Unwind_GetIPInfo'),
+  _Unwind_GetIPInfo: (context, ipBefore) => abort('Unwind_GetIPInfo'),
 
-  _Unwind_FindEnclosingFunction: () => 0, // we cannot succeed
+  _Unwind_FindEnclosingFunction: (ip) => 0, // we cannot succeed
 
   _Unwind_RaiseException__deps: ['__cxa_throw'],
   _Unwind_RaiseException: (ex) => {
@@ -3100,7 +3034,6 @@ mergeInto(LibraryManager.library, {
   // Used by wasm-emscripten-finalize to implement STACK_OVERFLOW_CHECK
   __handle_stack_overflow__deps: ['emscripten_stack_get_base', 'emscripten_stack_get_end', '$ptrToString'],
   __handle_stack_overflow: (requested) => {
-    requested = requested >>> 0;
     var base = _emscripten_stack_get_base();
     var end = _emscripten_stack_get_end();
     abort(`stack overflow (Attempt to set SP to ${ptrToString(requested)}` +
@@ -3162,6 +3095,9 @@ mergeInto(LibraryManager.library, {
   $dynCallLegacy__deps: ['$createDyncallWrapper'],
 #endif
   $dynCallLegacy: (sig, ptr, args) => {
+#if MEMORY64
+    sig = sig.replace(/p/g, 'j')
+#endif
 #if ASSERTIONS
 #if MINIMAL_RUNTIME
     assert(typeof dynCalls != 'undefined', 'Global dynCalls dictionary was not generated in the build! Pass -sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$dynCall linker flag to include it!');
@@ -3170,8 +3106,15 @@ mergeInto(LibraryManager.library, {
     assert(('dynCall_' + sig) in Module, `bad function pointer type - dynCall function not found for sig '${sig}'`);
 #endif
     if (args && args.length) {
+#if WASM_BIGINT
+      // j (64-bit integer) is fine, and is implemented as a BigInt. Without
+      // legalization, the number of parameters should match (j is not expanded
+      // into two i's).
+      assert(args.length === sig.length - 1);
+#else
       // j (64-bit integer) must be passed in as two numbers [low 32, high 32].
       assert(args.length === sig.substring(1).replace(/j/g, '--').length);
+#endif
     } else {
       assert(sig.length == 1);
     }
@@ -3209,8 +3152,16 @@ mergeInto(LibraryManager.library, {
 
   $dynCall__docs: '/** @param {Object=} args */',
   $dynCall: (sig, ptr, args) => {
+#if MEMORY64
+    // With MEMORY64 we have an additional step to convert `p` arguments to
+    // bigint. This is the runtime equivalent of the wrappers we create for wasm
+    // exports in `emscripten.py:create_wasm64_wrappers`.
+    for (var i = 1; i < sig.length; ++i) {
+      if (sig[i] == 'p') args[i-1] = BigInt(args[i-1]);
+    }
+#endif
 #if DYNCALLS
-    return dynCallLegacy(sig, ptr, args);
+    var rtn = dynCallLegacy(sig, ptr, args);
 #else
 #if !WASM_BIGINT
     // Without WASM_BIGINT support we cannot directly call function with i64 as
@@ -3223,21 +3174,12 @@ mergeInto(LibraryManager.library, {
 #if ASSERTIONS
     assert(getWasmTableEntry(ptr), `missing table entry in dynCall: ${ptr}`);
 #endif
-#if MEMORY64
-    // With MEMORY64 we have an additional step to convert `p` arguments to
-    // bigint. This is the runtime equivalent of the wrappers we create for wasm
-    // exports in `emscripten.py:create_wasm64_wrappers`.
-    for (var i = 1; i < sig.length; ++i) {
-      if (sig[i] == 'p') args[i-1] = BigInt(args[i-1]);
-    }
-#endif
     var rtn = getWasmTableEntry(ptr).apply(null, args);
+#endif
 #if MEMORY64
     return sig[0] == 'p' ? Number(rtn) : rtn;
 #else
     return rtn;
-#endif
-
 #endif
   },
 
@@ -3249,14 +3191,15 @@ mergeInto(LibraryManager.library, {
     }
   },
 
-#if SHRINK_LEVEL == 0
+#if SHRINK_LEVEL == 0 || ASYNCIFY == 2
   // A mirror copy of contents of wasmTable in JS side, to avoid relatively
-  // slow wasmTable.get() call. Only used when not compiling with -Os or -Oz.
+  // slow wasmTable.get() call. Only used when not compiling with -Os, -Oz, or
+  // JSPI which needs to instrument the functions.
   $wasmTableMirror__internal: true,
   $wasmTableMirror: [],
 
   $setWasmTableEntry__internal: true,
-  $setWasmTableEntry__deps: ['$wasmTableMirror'],
+  $setWasmTableEntry__deps: ['$wasmTableMirror', '$wasmTable'],
   $setWasmTableEntry: (idx, func) => {
     wasmTable.set(idx, func);
     // With ABORT_ON_WASM_EXCEPTIONS wasmTable.get is overriden to return wrapped
@@ -3266,7 +3209,7 @@ mergeInto(LibraryManager.library, {
   },
 
   $getWasmTableEntry__internal: true,
-  $getWasmTableEntry__deps: ['$wasmTableMirror'],
+  $getWasmTableEntry__deps: ['$wasmTableMirror', '$wasmTable'],
   $getWasmTableEntry: (funcPtr) => {
 #if MEMORY64
     // Function pointers are 64-bit, but wasmTable.get() requires a Number.
@@ -3277,8 +3220,13 @@ mergeInto(LibraryManager.library, {
     if (!func) {
       if (funcPtr >= wasmTableMirror.length) wasmTableMirror.length = funcPtr + 1;
       wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+#if ASYNCIFY == 2
+      if (Asyncify.isAsyncExport(func)) {
+        wasmTableMirror[funcPtr] = func = Asyncify.makeAsyncFunction(func);
+      }
+#endif
     }
-#if ASSERTIONS
+#if ASSERTIONS && ASYNCIFY != 2 // With JSPI the function stored in the table will be a wrapper.
     assert(wasmTable.get(funcPtr) == func, "JavaScript-side Wasm function table mirror is out of date!");
 #endif
     return func;
@@ -3286,8 +3234,10 @@ mergeInto(LibraryManager.library, {
 
 #else
 
+  $setWasmTableEntry__deps: ['$wasmTable'],
   $setWasmTableEntry: (idx, func) => wasmTable.set(idx, func),
 
+  $getWasmTableEntry__deps: ['$wasmTable'],
   $getWasmTableEntry: (funcPtr) => {
 #if MEMORY64
     // Function pointers are 64-bit, but wasmTable.get() requires a Number.
@@ -3385,6 +3335,9 @@ mergeInto(LibraryManager.library, {
   },
 
 #if !MINIMAL_RUNTIME
+#if STACK_OVERFLOW_CHECK
+  $handleException__deps: ['emscripten_stack_get_current'],
+#endif
   $handleException: (e) => {
     // Certain exception types we do not treat as errors since they are used for
     // internal control flow.
@@ -3567,12 +3520,12 @@ mergeInto(LibraryManager.library, {
   // tell the memory segments where to place themselves
   __memory_base: "new WebAssembly.Global({'value': '{{{ POINTER_WASM_TYPE }}}', 'mutable': false}, {{{ to64(GLOBAL_BASE) }}})",
   // the wasm backend reserves slot 0 for the NULL function pointer
-  __table_base: "new WebAssembly.Global({'value': '{{{ POINTER_WASM_TYPE }}}', 'mutable': false}, {{{ to64(1) }}})",
+  __table_base: "new WebAssembly.Global({'value': '{{{ POINTER_WASM_TYPE }}}', 'mutable': false}, {{{ to64(TABLE_BASE) }}})",
 #if MEMORY64 == 2
   __memory_base32: "new WebAssembly.Global({'value': 'i32', 'mutable': false}, {{{ GLOBAL_BASE }}})",
 #endif
 #if MEMORY64
-  __table_base32: 1,
+  __table_base32: {{{ TABLE_BASE }}},
 #endif
   // To support such allocations during startup, track them on __heap_base and
   // then when the main module is loaded it reads that value and uses it to
@@ -3592,7 +3545,7 @@ mergeInto(LibraryManager.library, {
 #endif
 #if ASYNCIFY == 1
   __asyncify_state: "new WebAssembly.Global({'value': 'i32', 'mutable': true}, 0)",
-  __asyncify_data: "new WebAssembly.Global({'value': 'i32', 'mutable': true}, 0)",
+  __asyncify_data: "new WebAssembly.Global({'value': '{{{ POINTER_WASM_TYPE }}}', 'mutable': true}, {{{ to64(0) }}})",
 #endif
 #endif
 
@@ -3621,38 +3574,59 @@ mergeInto(LibraryManager.library, {
 #endif
   },
 
+  $handleAllocatorInit: function() {
+    Object.assign(HandleAllocator.prototype, /** @lends {HandleAllocator.prototype} */ {
+      get(id) {
+  #if ASSERTIONS
+        assert(this.allocated[id] !== undefined, `invalid handle: ${id}`);
+  #endif
+        return this.allocated[id];
+      },
+      has(id) {
+        return this.allocated[id] !== undefined;
+      },
+      allocate(handle) {
+        var id = this.freelist.pop() || this.allocated.length;
+        this.allocated[id] = handle;
+        return id;
+      },
+      free(id) {
+  #if ASSERTIONS
+        assert(this.allocated[id] !== undefined);
+  #endif
+        // Set the slot to `undefined` rather than using `delete` here since
+        // apparently arrays with holes in them can be less efficient.
+        this.allocated[id] = undefined;
+        this.freelist.push(id);
+      }
+    });
+  },
+
+  $HandleAllocator__postset: 'handleAllocatorInit()',
+  $HandleAllocator__deps: ['$handleAllocatorInit'],
   $HandleAllocator__docs: '/** @constructor */',
   $HandleAllocator: function() {
     // Reserve slot 0 so that 0 is always an invalid handle
     this.allocated = [undefined];
     this.freelist = [];
-    this.get = function(id) {
-#if ASSERTIONS
-      assert(this.allocated[id] !== undefined, `invalid handle: ${id}`);
-#endif
-      return this.allocated[id];
-    };
-    this.has = function(id) {
-      return this.allocated[id] !== undefined;
-    };
-    this.allocate = function(handle) {
-      var id = this.freelist.pop() || this.allocated.length;
-      this.allocated[id] = handle;
-      return id;
-    };
-    this.free = function(id) {
-#if ASSERTIONS
-      assert(this.allocated[id] !== undefined);
-#endif
-      // Set the slot to `undefined` rather than using `delete` here since
-      // apparently arrays with holes in them can be less efficient.
-      this.allocated[id] = undefined;
-      this.freelist.push(id);
-    };
   },
 
   $getNativeTypeSize__deps: ['$POINTER_SIZE'],
   $getNativeTypeSize: {{{ getNativeTypeSize }}},
+
+#if RELOCATABLE
+  // In RELOCATABLE mode we create the table in JS.
+  $wasmTable: `=new WebAssembly.Table({
+  'initial': {{{ INITIAL_TABLE }}},
+#if !ALLOW_TABLE_GROWTH
+  'maximum': {{{ INITIAL_TABLE }}},
+#endif
+  'element': 'anyfunc'
+});
+`,
+#else
+  $wasmTable: undefined,
+#endif
 
   // We used to define these globals unconditionally in support code.
   // Instead, we now define them here so folks can pull it in explicitly, on
@@ -3711,7 +3685,7 @@ DEFAULT_LIBRARY_FUNCS_TO_INCLUDE.push(
 #endif
 
 function wrapSyscallFunction(x, library, isWasi) {
-  if (x[0] === '$' || isJsLibraryConfigIdentifier(x)) {
+  if (isJsOnlySymbol(x) || isDecorator(x)) {
     return;
   }
 

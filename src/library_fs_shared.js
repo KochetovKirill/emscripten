@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-mergeInto(LibraryManager.library, {
+addToLibrary({
   $preloadPlugins: "{{{ makeModuleReceiveExpr('preloadPlugins', '[]') }}}",
 
 #if !MINIMAL_RUNTIME
@@ -12,14 +12,14 @@ mergeInto(LibraryManager.library, {
   // it was handled.
   $FS_handledByPreloadPlugin__internal: true,
   $FS_handledByPreloadPlugin__deps: ['$preloadPlugins'],
-  $FS_handledByPreloadPlugin: function(byteArray, fullname, finish, onerror) {
+  $FS_handledByPreloadPlugin: (byteArray, fullname, finish, onerror) => {
 #if LibraryManager.has('library_browser.js')
     // Ensure plugins are ready.
     if (typeof Browser != 'undefined') Browser.init();
 #endif
 
     var handled = false;
-    preloadPlugins.forEach(function(plugin) {
+    preloadPlugins.forEach((plugin) => {
       if (handled) return;
       if (plugin['canHandle'](fullname)) {
         plugin['handle'](byteArray, fullname, finish, onerror);
@@ -45,11 +45,12 @@ mergeInto(LibraryManager.library, {
   $FS_createPreloadedFile__deps: [
     '$asyncLoad',
     '$PATH_FS',
+    '$FS_createDataFile',
 #if !MINIMAL_RUNTIME
     '$FS_handledByPreloadPlugin',
 #endif
   ],
-  $FS_createPreloadedFile: function(parent, name, url, canRead, canWrite, onload, onerror, dontCreateFile, canOwn, preFinish) {
+  $FS_createPreloadedFile: (parent, name, url, canRead, canWrite, onload, onerror, dontCreateFile, canOwn, preFinish) => {
     // TODO we should allow people to just pass in a complete filename instead
     // of parent and name being that we just join them anyways
     var fullname = name ? PATH_FS.resolve(PATH.join2(parent, name)) : parent;
@@ -58,7 +59,7 @@ mergeInto(LibraryManager.library, {
       function finish(byteArray) {
         if (preFinish) preFinish();
         if (!dontCreateFile) {
-          FS.createDataFile(parent, name, byteArray, canRead, canWrite, canOwn);
+          FS_createDataFile(parent, name, byteArray, canRead, canWrite, canOwn);
         }
         if (onload) onload();
         removeRunDependency(dep);
@@ -81,7 +82,7 @@ mergeInto(LibraryManager.library, {
     }
   },
   // convert the 'r', 'r+', etc. to it's corresponding set of O_* flags
-  $FS_modeStringToFlags: function(str) {
+  $FS_modeStringToFlags: (str) => {
     var flagModes = {
       'r': {{{ cDefs.O_RDONLY }}},
       'r+': {{{ cDefs.O_RDWR }}},
@@ -96,11 +97,78 @@ mergeInto(LibraryManager.library, {
     }
     return flags;
   },
-  $FS_getMode: function(canRead, canWrite) {
+  $FS_getMode: (canRead, canWrite) => {
     var mode = 0;
     if (canRead) mode |= {{{ cDefs.S_IRUGO }}} | {{{ cDefs.S_IXUGO }}};
     if (canWrite) mode |= {{{ cDefs.S_IWUGO }}};
     return mode;
+  },
+
+  $FS_stdin_getChar_buffer: [],
+
+  // getChar has 3 particular return values:
+  // a.) the next character represented as an integer
+  // b.) undefined to signal that no data is currently available
+  // c.) null to signal an EOF
+  $FS_stdin_getChar__deps: [
+    '$FS_stdin_getChar_buffer',
+    '$intArrayFromString',
+  ],
+  $FS_stdin_getChar: () => {
+    if (!FS_stdin_getChar_buffer.length) {
+      var result = null;
+#if ENVIRONMENT_MAY_BE_NODE
+      if (ENVIRONMENT_IS_NODE) {
+        // we will read data by chunks of BUFSIZE
+        var BUFSIZE = 256;
+        var buf = Buffer.alloc(BUFSIZE);
+        var bytesRead = 0;
+
+        // For some reason we must suppress a closure warning here, even though
+        // fd definitely exists on process.stdin, and is even the proper way to
+        // get the fd of stdin,
+        // https://github.com/nodejs/help/issues/2136#issuecomment-523649904
+        // This started to happen after moving this logic out of library_tty.js,
+        // so it is related to the surrounding code in some unclear manner.
+        /** @suppress {missingProperties} */
+        var fd = process.stdin.fd;
+
+        try {
+          bytesRead = fs.readSync(fd, buf);
+        } catch(e) {
+          // Cross-platform differences: on Windows, reading EOF throws an exception, but on other OSes,
+          // reading EOF returns 0. Uniformize behavior by treating the EOF exception to return 0.
+          if (e.toString().includes('EOF')) bytesRead = 0;
+          else throw e;
+        }
+
+        if (bytesRead > 0) {
+          result = buf.slice(0, bytesRead).toString('utf-8');
+        } else {
+          result = null;
+        }
+      } else
+#endif
+      if (typeof window != 'undefined' &&
+        typeof window.prompt == 'function') {
+        // Browser.
+        result = window.prompt('Input: ');  // returns null on cancel
+        if (result !== null) {
+          result += '\n';
+        }
+      } else if (typeof readline == 'function') {
+        // Command line.
+        result = readline();
+        if (result !== null) {
+          result += '\n';
+        }
+      }
+      if (!result) {
+        return null;
+      }
+      FS_stdin_getChar_buffer = intArrayFromString(result, true);
+    }
+    return FS_stdin_getChar_buffer.shift();
   },
 });
 

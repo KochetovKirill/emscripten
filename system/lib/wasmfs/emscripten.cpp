@@ -53,10 +53,11 @@ std::string getPath(int fd) {
 
 } // namespace wasmfs
 
-extern "C"
-char *emscripten_get_preloaded_image_data_from_FILE(FILE *file,
-                                                    int *w,
-                                                    int *h) {
+extern "C" {
+
+char* emscripten_get_preloaded_image_data_from_FILE(FILE* file,
+                                                    int* w,
+                                                    int* h) {
   auto fd = fileno(file);
   if (fd < 0) {
     return 0;
@@ -65,3 +66,5 @@ char *emscripten_get_preloaded_image_data_from_FILE(FILE *file,
   auto path = wasmfs::getPath(fd);
   return emscripten_get_preloaded_image_data(path.c_str(), w, h);
 }
+
+} // extern "C"
